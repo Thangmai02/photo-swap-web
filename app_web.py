@@ -6,8 +6,12 @@ Phiên bản nâng cấp giao diện & trải nghiệm người dùng
 import streamlit as st
 from PIL import Image
 import io
+import csv
 import time
+import datetime
 import zipfile
+import pandas as pd
+import requests
 from pathlib import Path
 from google import genai
 from google.genai import types
@@ -47,6 +51,50 @@ MAX_RETRIES = 4
 RETRY_BASE_DELAY = 5
 USD_TO_VND = 26000  # tỷ giá ước tính, có thể chỉnh lại cho đúng thời điểm
 
+LOG_DIR = Path.home() / "PhotoSwap_Logs"
+LOG_PATH = LOG_DIR / "billing_log.csv"
+LOG_FIELDS = [
+    "timestamp", "user", "model", "resolution", "format",
+    "ref_image", "status", "cost_usd", "cost_vnd",
+]
+
+# ⚠️ ĐỔI MẬT KHẨU NÀY trước khi chia sẻ app cho bạn bè!
+# Chỉ ai biết mật khẩu này mới xem được mục "Lịch sử sử dụng & thanh toán".
+# Nếu deploy lên Streamlit Cloud, nên tạo file .streamlit/secrets.toml với dòng:
+#   admin_password = "mật khẩu của bạn"
+# để không lộ mật khẩu ngay trong code.
+try:
+    ADMIN_PASSWORD = st.secrets["admin_password"]
+except Exception:
+    ADMIN_PASSWORD = "doimatkhaunay123"
+
+# ==================== ĐỒNG BỘ LOG VỀ 1 NƠI (KHÔNG CẦN DATABASE) ====================
+# Nếu bạn bè chạy app trên MÁY CỦA HỌ (không phải chung 1 server), log CSV sẽ nằm
+# trên máy của từng người, bạn sẽ không tự động thấy được.
+# Cách khắc phục không cần database thật: dùng 1 Google Sheet làm nơi lưu trữ chung.
+# Mỗi máy chạy app sẽ tự gửi 1 dòng log lên Sheet đó qua đường link Web App bên dưới.
+#
+# Cách lấy URL này (làm 1 lần, chỉ chủ app cần làm):
+#   1. Tạo 1 Google Sheet mới (trên Drive của bạn).
+#   2. Vào Extensions > Apps Script, xoá code mẫu, dán đoạn script mình đưa kèm.
+#   3. Bấm Deploy > New deployment > chọn loại "Web app".
+#      - Execute as: Me
+#      - Who has access: Anyone
+#   4. Copy "Web app URL" và dán vào biến REMOTE_LOG_WEBHOOK_URL bên dưới.
+#   5. (Tuỳ chọn) Dán link chia sẻ (chỉ xem) của chính Google Sheet vào REMOTE_SHEET_VIEW_URL
+#      để có nút mở nhanh trong app.
+#
+# Nếu để trống, app vẫn hoạt động bình thường — chỉ là log sẽ chỉ lưu cục bộ trên từng máy.
+try:
+    REMOTE_LOG_WEBHOOK_URL = st.secrets["remote_log_webhook_url"]
+except Exception:
+    REMOTE_LOG_WEBHOOK_URL = "https://script.google.com/macros/s/AKfycbxKYNYVmQ6JASp5xOf9EmuSjRT3l4w25bll9gg22fSFBmYhGNVhfg5FAxS6zxqG6FBS/exec"  # dán URL Web App (Google Apps Script) vào đây
+
+try:
+    REMOTE_SHEET_VIEW_URL = st.secrets["remote_sheet_view_url"]
+except Exception:
+    REMOTE_SHEET_VIEW_URL = ""  # dán link chia sẻ (chỉ xem) của Google Sheet vào đây, không bắt buộc
+
 SIZE_PRESETS = {
     "Giữ nguyên": None,
     "9:16 (1080x1920)": (1080, 1920),
@@ -66,6 +114,15 @@ for key, default in {
     "has_run": False,
     "is_processing": False,
     "last_run_output_dir": "",
+    "proc_running": False,
+    "proc_idx": 0,
+    "proc_total": 0,
+    "proc_start_time": None,
+    "proc_log": [],
+    "used_names": set(),
+    "stop_requested": False,
+    "user_name": "",
+    "is_admin": False,
 }.items():
     if key not in st.session_state:
         st.session_state[key] = default
@@ -298,14 +355,99 @@ def extract_pil_image(part):
 
 
 def save_image(pil_image, output_dir: Path, filename: str, fmt: str, quality: int):
+    """filename đã bao gồm đuôi mở rộng và đã được đảm bảo không trùng."""
     output_dir.mkdir(parents=True, exist_ok=True)
-    ext = ".png" if fmt == "PNG" else ".jpg"
-    path = output_dir / f"{filename}{ext}"
+    path = output_dir / filename
 
     if fmt == "JPG" and pil_image.mode in ("RGBA", "P"):
         pil_image = pil_image.convert("RGB")
     pil_image.save(path, quality=quality if fmt == "JPG" else None)
     return path
+
+
+def get_unique_name(base_name: str, ext: str, used_names: set, output_dir: Path = None) -> str:
+    """Trả về tên file (kèm đuôi) không bị trùng với file đã tạo trong phiên này
+    lẫn file đã có sẵn trong folder đích (nếu auto_save bật)."""
+    candidate = f"{base_name}{ext}"
+    counter = 1
+    while candidate in used_names or (output_dir and (output_dir / candidate).exists()):
+        candidate = f"{base_name}_{counter}{ext}"
+        counter += 1
+    used_names.add(candidate)
+    return candidate
+
+
+# Các mã lỗi phổ biến của Gemini API mà KHÔNG bị trừ token/tiền
+# (theo trang billing chính thức: request lỗi 400/500 không bị tính phí token;
+#  logic tương tự áp dụng cho các lỗi khác vì request bị từ chối trước khi model
+#  kịp sinh nội dung, nên chưa phát sinh chi phí):
+#   400 INVALID_ARGUMENT, 401/403 PERMISSION_DENIED, 404 NOT_FOUND,
+#   429 RESOURCE_EXHAUSTED (hết quota/rate limit), 500 INTERNAL,
+#   503 UNAVAILABLE (quá tải), 504 DEADLINE_EXCEEDED (timeout)
+NON_BILLABLE_STATUSES = {"error", "no_image"}
+
+
+def log_usage(user, model_label, res_label, fmt, ref_image, status, cost_usd):
+    """Ghi 1 dòng log mỗi khi xử lý xong 1 ảnh (thành công hoặc lỗi).
+    Chỉ tính tiền (cost_usd > 0) khi status == "success" — các lỗi API
+    phổ biến (400/429/500/503...) không làm tốn token nên được ghi 0đ."""
+    if status in NON_BILLABLE_STATUSES:
+        cost_usd = 0.0
+
+    row = {
+        "timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "user": user or "Không rõ",
+        "model": model_label,
+        "resolution": res_label,
+        "format": fmt,
+        "ref_image": ref_image,
+        "status": status,
+        "cost_usd": round(cost_usd, 4),
+        "cost_vnd": round(cost_usd * USD_TO_VND),
+    }
+
+    # --- Ghi cục bộ trên máy đang chạy app ---
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    is_new = not LOG_PATH.exists()
+    with open(LOG_PATH, "a", newline="", encoding="utf-8-sig") as f:
+        writer = csv.DictWriter(f, fieldnames=LOG_FIELDS)
+        if is_new:
+            writer.writeheader()
+        writer.writerow(row)
+
+    # --- Gửi thêm lên Google Sheet trung tâm (nếu đã cấu hình) ---
+    # Không chặn app nếu gửi lỗi/mất mạng — log cục bộ vẫn luôn được ghi ở trên.
+    if REMOTE_LOG_WEBHOOK_URL:
+        try:
+            requests.post(REMOTE_LOG_WEBHOOK_URL, json=row, timeout=5)
+        except Exception:
+            pass
+
+
+def load_usage_log() -> pd.DataFrame:
+    if not LOG_PATH.exists():
+        return pd.DataFrame(columns=LOG_FIELDS)
+    try:
+        return pd.read_csv(LOG_PATH)
+    except Exception:
+        return pd.DataFrame(columns=LOG_FIELDS)
+
+
+def pick_folder_dialog():
+    """Mở hộp thoại chọn thư mục của hệ điều hành (chỉ hoạt động khi chạy app
+    trên máy tính cá nhân có giao diện, không hoạt động khi deploy lên server)."""
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+
+        root = tk.Tk()
+        root.withdraw()
+        root.wm_attributes("-topmost", 1)
+        folder = filedialog.askdirectory()
+        root.destroy()
+        return folder or None
+    except Exception:
+        return None
 
 
 def make_zip(results):
@@ -352,6 +494,21 @@ with st.sidebar:
     st.caption("[Lấy API Key miễn phí →](https://aistudio.google.com/apikey)")
     st.divider()
 
+    st.markdown("### 👤 Người dùng")
+    user_name_input = st.text_input(
+        "Tên/nickname của bạn",
+        value=st.session_state.get("user_name", ""),
+        placeholder="VD: Minh, Lan, Hùng...",
+        help="Dùng để ghi nhận vào lịch sử thanh toán, vì app đang dùng chung 1 API Key.",
+    )
+    st.session_state["user_name"] = user_name_input
+    if not user_name_input:
+        st.markdown(
+            '<span class="ps-status-warn">● Nhập tên để ghi nhận chi phí</span>',
+            unsafe_allow_html=True,
+        )
+    st.divider()
+
     st.markdown("### ⚙️ Cấu hình model")
 
     if "model_select" not in st.session_state:
@@ -394,11 +551,59 @@ with st.sidebar:
     st.divider()
     st.markdown("### 💾 Lưu kết quả")
     auto_save = st.checkbox("Tự động lưu vào folder máy tính", value=True)
-    output_path = st.text_input(
-        "Đường dẫn folder",
-        value=str(Path.home() / "PhotoSwap_Results"),
-        disabled=not auto_save,
+
+    if "output_path" not in st.session_state:
+        st.session_state["output_path"] = str(Path.home() / "PhotoSwap_Results")
+
+    col_path, col_pick = st.columns([3, 1])
+    with col_path:
+        output_path = st.text_input(
+            "Đường dẫn folder",
+            key="output_path",
+            disabled=not auto_save,
+            label_visibility="collapsed",
+        )
+    with col_pick:
+        if st.button("📁", use_container_width=True, disabled=not auto_save, help="Chọn thư mục"):
+            picked = pick_folder_dialog()
+            if picked:
+                st.session_state["output_path"] = picked
+                st.rerun()
+            else:
+                st.toast("Không mở được hộp thoại chọn thư mục trên môi trường này, hãy dán đường dẫn thủ công.")
+
+    st.divider()
+    with st.expander("🔒 Khu vực quản trị"):
+        if st.session_state.get("is_admin"):
+            st.markdown(
+                '<span class="ps-status-ok">● Đang xem với quyền quản trị</span>',
+                unsafe_allow_html=True,
+            )
+            if st.button("Đăng xuất quản trị", use_container_width=True):
+                st.session_state["is_admin"] = False
+                st.rerun()
+        else:
+            admin_pwd = st.text_input("Mật khẩu quản trị", type="password", key="admin_pwd_input")
+            if st.button("Đăng nhập", use_container_width=True):
+                if admin_pwd == ADMIN_PASSWORD:
+                    st.session_state["is_admin"] = True
+                    st.rerun()
+                else:
+                    st.error("Sai mật khẩu.")
+
+# ==================== YÊU CẦU NHẬP TÊN TRƯỚC KHI DÙNG ====================
+if not st.session_state.get("user_name"):
+    st.markdown('<div class="ps-card">', unsafe_allow_html=True)
+    st.markdown(
+        '<div class="ps-section-title">👋 Chào bạn, trước khi bắt đầu...</div>',
+        unsafe_allow_html=True,
     )
+    st.warning(
+        "App đang dùng chung 1 API Key nên cần bạn nhập **tên/nickname** ở mục "
+        "**👤 Người dùng** trên thanh bên trái trước, để hệ thống ghi nhận đúng chi phí của từng người."
+    )
+    st.markdown("</div>", unsafe_allow_html=True)
+    st.stop()
 
 # ==================== BƯỚC 1: ẢNH ====================
 st.markdown('<div class="ps-card">', unsafe_allow_html=True)
@@ -487,18 +692,24 @@ if ref_files:
     st.caption(f"Tỷ giá quy đổi tạm tính: 1 USD ≈ {USD_TO_VND:,.0f}₫")
     st.write("")
 
-run_clicked = st.button(
-    "🚀 Bắt đầu xử lý",
-    type="primary",
-    use_container_width=True,
-)
+# ==================== NÚT ĐIỀU KHIỂN ====================
+if st.session_state.get("proc_running"):
+    if st.button("⏹ Dừng tiến trình", use_container_width=True):
+        st.session_state["stop_requested"] = True
+    start_clicked = False
+else:
+    start_clicked = st.button(
+        "🚀 Bắt đầu xử lý",
+        type="primary",
+        use_container_width=True,
+    )
 if not (base_file and ref_files):
     st.caption("⚠️ Vui lòng tải lên ảnh gốc và ít nhất một ảnh tham chiếu để bắt đầu.")
 
 st.markdown("</div>", unsafe_allow_html=True)
 
-# ==================== KIỂM TRA ĐIỀU KIỆN ====================
-if run_clicked:
+# ==================== KIỂM TRA ĐIỀU KIỆN & KHỞI TẠO BATCH MỚI ====================
+if start_clicked:
     missing = []
     if not base_file:
         missing.append("ảnh gốc (người mẫu)")
@@ -506,35 +717,60 @@ if run_clicked:
         missing.append("ảnh tham chiếu (trang phục)")
     if not st.session_state.get("api_key"):
         missing.append("API Key (nhập ở thanh bên trái rồi bấm 'Lưu key')")
+    if not st.session_state.get("user_name"):
+        missing.append("Tên của bạn (để ghi nhận chi phí, nhập ở thanh bên trái)")
 
     if missing:
         st.error("❌ Chưa thể bắt đầu, còn thiếu: " + ", ".join(missing))
-        run_clicked = False
+    else:
+        st.session_state["proc_running"] = True
+        st.session_state["proc_idx"] = 0
+        st.session_state["proc_total"] = len(ref_files)
+        st.session_state["proc_start_time"] = time.time()
+        st.session_state["proc_log"] = []
+        st.session_state["used_names"] = set()
+        st.session_state["results"] = []
+        st.session_state["saved_paths"] = []
+        st.session_state["errors"] = []
+        st.session_state["has_run"] = False
+        st.session_state["stop_requested"] = False
+        st.session_state["last_run_output_dir"] = str(output_path)
+        st.rerun()
 
-# ==================== XỬ LÝ ====================
-if run_clicked:
-    client = genai.Client(api_key=st.session_state["api_key"])
-    results = []
-    saved_paths = []
-    errors = []
+# ==================== XỬ LÝ: MỖI LẦN RERUN XỬ LÝ 1 ẢNH ====================
+# (Cách này giúp nút "Dừng tiến trình" có thể bấm được giữa chừng,
+#  vì Streamlit chỉ nhận thao tác của người dùng giữa các lần rerun.)
+if st.session_state.get("proc_running"):
+    idx = st.session_state["proc_idx"]
+    total = st.session_state["proc_total"]
 
-    progress = st.progress(0, text="Đang xử lý...")
-    status = st.status("Đang chạy Gemini...", expanded=True)
+    st.markdown('<div class="ps-card">', unsafe_allow_html=True)
+    st.markdown('<div class="ps-section-title">⏳ Đang xử lý</div>', unsafe_allow_html=True)
+    st.progress(idx / total if total else 0, text=f"{idx}/{total} ảnh")
 
-    output_dir = Path(output_path)
-    start_time = time.time()
+    if st.session_state.get("stop_requested"):
+        st.session_state["proc_running"] = False
+        st.session_state["has_run"] = True
+        st.warning(f"⏹ Đã dừng theo yêu cầu — đã xử lý {idx}/{total} ảnh.")
 
-    for i, ref_file in enumerate(ref_files, 1):
-        elapsed = time.time() - start_time
-        avg = elapsed / max(i - 1, 1)
-        remaining = avg * (len(ref_files) - i + 1) if i > 1 else 0
-        eta_txt = f" · còn ~{int(remaining)}s" if remaining > 1 else ""
-        status.write(f"🔄 Đang xử lý ({i}/{len(ref_files)}): **{ref_file.name}**{eta_txt}")
+    elif idx >= total:
+        st.session_state["proc_running"] = False
+        st.session_state["has_run"] = True
+        elapsed = time.time() - (st.session_state.get("proc_start_time") or time.time())
+        st.success(f"✅ Hoàn tất trong {elapsed:.0f}s")
+
+    else:
+        ref_file = ref_files[idx]
+        st.write(f"🔄 Đang xử lý ({idx + 1}/{total}): **{ref_file.name}**")
 
         try:
+            client = genai.Client(api_key=st.session_state["api_key"])
+            output_dir = Path(output_path)
+
             base_pil = Image.open(base_file)
             ref_pil = Image.open(ref_file)
 
+            response = None
             for attempt in range(1, MAX_RETRIES + 1):
                 try:
                     config = None
@@ -556,7 +792,9 @@ if run_clicked:
                 except Exception as e:
                     if attempt == MAX_RETRIES:
                         raise e
-                    status.write(f"   ⏳ Thử lại lần {attempt}/{MAX_RETRIES}...")
+                    st.session_state["proc_log"].append(
+                        f"⏳ {ref_file.name}: thử lại lần {attempt}/{MAX_RETRIES}..."
+                    )
                     time.sleep(RETRY_BASE_DELAY * (2 ** (attempt - 1)))
 
             found = False
@@ -566,47 +804,63 @@ if run_clicked:
                     if custom_size:
                         img = img.resize(custom_size, Image.LANCZOS)
 
+                    ext = ".png" if output_format == "PNG" else ".jpg"
+                    base_name = Path(ref_file.name).stem + "-result"
+                    unique_name = get_unique_name(
+                        base_name, ext, st.session_state["used_names"],
+                        output_dir if auto_save else None,
+                    )
+
                     if auto_save:
-                        saved_path = save_image(
-                            img, output_dir,
-                            Path(ref_file.name).stem + "-result",
-                            output_format, jpg_quality,
-                        )
-                        saved_paths.append(saved_path)
+                        saved_path = save_image(img, output_dir, unique_name, output_format, jpg_quality)
+                        st.session_state["saved_paths"].append(saved_path)
 
                     buf = io.BytesIO()
                     img.save(buf, format=output_format)
-                    results.append({
-                        "name": f"{Path(ref_file.name).stem}-result.{output_format.lower()}",
-                        "image": img,
+                    st.session_state["results"].append({
+                        "name": unique_name,
                         "bytes": buf.getvalue(),
                     })
                     found = True
                     break
 
             if found:
-                status.write(f"   ✅ Xong: {ref_file.name}")
+                st.session_state["proc_log"].append(f"✅ Xong: {ref_file.name}")
+                log_status = "success"
             else:
-                status.write(f"   ⚠️ Không nhận được ảnh kết quả cho: {ref_file.name}")
-                errors.append((ref_file.name, "Không nhận được ảnh kết quả từ model"))
+                st.session_state["proc_log"].append(f"⚠️ Không nhận được ảnh kết quả cho: {ref_file.name}")
+                st.session_state["errors"].append((ref_file.name, "Không nhận được ảnh kết quả từ model"))
+                log_status = "no_image"
 
         except Exception as e:
-            status.write(f"   ❌ Lỗi với {ref_file.name}: {e}")
-            errors.append((ref_file.name, str(e)))
+            st.session_state["proc_log"].append(f"❌ Lỗi với {ref_file.name}: {e}")
+            st.session_state["errors"].append((ref_file.name, str(e)))
+            log_status = "error"
 
-        progress.progress(i / len(ref_files))
+        # Ghi log thanh toán cho ảnh vừa xử lý
+        tier_for_log = resolution_code or "1K"
+        cost_usd_one = PRICE_TABLE.get(model_id, {}).get(tier_for_log, 0.05)
+        log_usage(
+            user=st.session_state.get("user_name"),
+            model_label=model_label,
+            res_label=res_label,
+            fmt=output_format,
+            ref_image=ref_file.name,
+            status=log_status,
+            cost_usd=cost_usd_one,
+        )
 
-    total_elapsed = time.time() - start_time
-    status.update(
-        label=f"✅ Hoàn tất trong {total_elapsed:.0f}s — {len(results)}/{len(ref_files)} ảnh thành công",
-        state="complete",
-    )
+        st.session_state["proc_idx"] = idx + 1
 
-    st.session_state["results"] = results
-    st.session_state["saved_paths"] = saved_paths
-    st.session_state["errors"] = errors
-    st.session_state["has_run"] = True
-    st.session_state["last_run_output_dir"] = str(output_path)
+    if st.session_state.get("proc_log"):
+        with st.expander("📜 Nhật ký xử lý", expanded=True):
+            for line in st.session_state["proc_log"][-40:]:
+                st.write(line)
+
+    st.markdown("</div>", unsafe_allow_html=True)
+
+    if st.session_state.get("proc_running"):
+        st.rerun()
 
 # ==================== TỔNG KẾT (bền vững qua rerun) ====================
 results = st.session_state.get("results", [])
@@ -655,5 +909,156 @@ if st.session_state.get("has_run"):
         with st.expander(f"❌ Chi tiết {fail_count} ảnh lỗi"):
             for name, err_msg in errors:
                 st.write(f"**{name}**: {err_msg}")
+
+    st.markdown("</div>", unsafe_allow_html=True)
+
+# ==================== LỊCH SỬ SỬ DỤNG & THANH TOÁN (chỉ admin) ====================
+if st.session_state.get("is_admin"):
+    st.markdown('<div class="ps-card">', unsafe_allow_html=True)
+    st.markdown(
+        '<div class="ps-section-title">💳 Lịch sử sử dụng & thanh toán</div>',
+        unsafe_allow_html=True,
+    )
+    st.caption(
+        "App dùng chung 1 API Key nên phần này ghi nhận theo **tên bạn tự nhập** ở thanh bên trái, "
+        "không phải đăng nhập thật — mọi người cần tự giác nhập đúng tên để số liệu chính xác."
+    )
+
+    if REMOTE_LOG_WEBHOOK_URL:
+        st.markdown(
+            '<span class="ps-status-ok">☁️ Đang đồng bộ log lên Google Sheet trung tâm</span>',
+            unsafe_allow_html=True,
+        )
+        if REMOTE_SHEET_VIEW_URL:
+            st.link_button("📄 Mở Google Sheet tổng hợp (tất cả các máy)", REMOTE_SHEET_VIEW_URL,
+                            use_container_width=True)
+        st.caption("Bảng dưới đây chỉ đọc từ log **trên máy này**. Muốn xem gộp từ mọi máy, mở Google Sheet ở trên.")
+    else:
+        st.markdown(
+            '<span class="ps-status-warn">⚠️ Chưa đồng bộ trung tâm — log chỉ lưu trên máy này</span>',
+            unsafe_allow_html=True,
+        )
+        st.caption(
+            "Nếu bạn bè chạy app trên máy khác, log của họ sẽ KHÔNG hiện ở đây. "
+            "Xem hướng dẫn cấu hình `REMOTE_LOG_WEBHOOK_URL` ở đầu file `app_web.py` để gom log về 1 Google Sheet chung."
+        )
+
+    log_df = load_usage_log()
+
+    if log_df.empty:
+        st.info("Chưa có dữ liệu sử dụng nào được ghi nhận.")
+    else:
+        log_df["cost_usd"] = pd.to_numeric(log_df["cost_usd"], errors="coerce").fillna(0)
+        log_df["cost_vnd"] = pd.to_numeric(log_df["cost_vnd"], errors="coerce").fillna(0)
+        log_df["timestamp"] = pd.to_datetime(log_df["timestamp"], errors="coerce")
+
+        # --- Tổng chi tiêu TOÀN BỘ từ trước tới giờ (không phụ thuộc bộ lọc) ---
+        total_all_time_vnd = log_df["cost_vnd"].sum()
+        total_all_time_images = len(log_df)
+        tcol1, tcol2 = st.columns(2)
+        with tcol1:
+            st.markdown(
+                f'<div class="ps-cost-box"><div>'
+                f'<div class="ps-cost-label">💰 Tổng đã chi tiêu (từ trước đến giờ)</div>'
+                f'<div class="ps-cost-num">{total_all_time_vnd:,.0f}₫</div>'
+                f'</div></div>',
+                unsafe_allow_html=True,
+            )
+        with tcol2:
+            st.markdown(
+                f'<div class="ps-cost-box"><div>'
+                f'<div class="ps-cost-label">🖼️ Tổng số ảnh đã xử lý (từ trước đến giờ)</div>'
+                f'<div class="ps-cost-num">{total_all_time_images} ảnh</div>'
+                f'</div></div>',
+                unsafe_allow_html=True,
+            )
+        st.caption(
+            "File log được **cộng dồn mãi mãi**, không tự xoá hay reset qua ngày mới — "
+            "hôm nay dùng bao nhiêu, mai mở lên vẫn còn nguyên và cộng thêm vào, cho đến khi bạn chủ động xoá file log."
+        )
+        st.write("")
+
+        # --- Bộ lọc theo ngày ---
+        min_date = log_df["timestamp"].min().date()
+        max_date = log_df["timestamp"].max().date()
+
+        qf1, qf2, qf3 = st.columns(3)
+        with qf1:
+            if st.button("📅 Hôm nay", use_container_width=True):
+                st.session_state["log_from_date"] = datetime.date.today()
+                st.session_state["log_to_date"] = datetime.date.today()
+        with qf2:
+            if st.button("📅 7 ngày qua", use_container_width=True):
+                st.session_state["log_from_date"] = datetime.date.today() - datetime.timedelta(days=6)
+                st.session_state["log_to_date"] = datetime.date.today()
+        with qf3:
+            if st.button("📅 Tất cả", use_container_width=True):
+                st.session_state["log_from_date"] = min_date
+                st.session_state["log_to_date"] = max_date
+
+        if "log_from_date" not in st.session_state:
+            st.session_state["log_from_date"] = min_date
+        if "log_to_date" not in st.session_state:
+            st.session_state["log_to_date"] = max_date
+
+        dcol1, dcol2 = st.columns(2)
+        with dcol1:
+            from_date = st.date_input("Từ ngày", key="log_from_date")
+        with dcol2:
+            to_date = st.date_input("Đến ngày", key="log_to_date")
+
+        mask = (log_df["timestamp"].dt.date >= from_date) & (log_df["timestamp"].dt.date <= to_date)
+        filtered = log_df[mask]
+
+        # --- Tổng theo người dùng (trong khoảng đã lọc) ---
+        summary = (
+            filtered.groupby("user")
+            .agg(so_anh=("ref_image", "count"), tong_usd=("cost_usd", "sum"), tong_vnd=("cost_vnd", "sum"))
+            .reset_index()
+            .sort_values("tong_vnd", ascending=False)
+        )
+        summary.columns = ["Người dùng", "Số ảnh", "Tổng (USD)", "Tổng (VNĐ)"]
+        summary["Tổng (USD)"] = summary["Tổng (USD)"].round(2)
+        summary["Tổng (VNĐ)"] = summary["Tổng (VNĐ)"].round(0).astype(int)
+
+        st.markdown("**📊 Chi phí theo từng người (trong khoảng đã chọn)**")
+        st.dataframe(summary, use_container_width=True, hide_index=True)
+
+        # --- Chi tiêu theo từng ngày (trong khoảng đã lọc) ---
+        daily = (
+            filtered.assign(ngay=filtered["timestamp"].dt.date)
+            .groupby("ngay")
+            .agg(so_anh=("ref_image", "count"), tong_vnd=("cost_vnd", "sum"))
+            .reset_index()
+            .sort_values("ngay", ascending=False)
+        )
+        daily.columns = ["Ngày", "Số ảnh", "Tổng (VNĐ)"]
+        daily["Tổng (VNĐ)"] = daily["Tổng (VNĐ)"].round(0).astype(int)
+
+        st.markdown("**📅 Chi tiêu theo từng ngày (trong khoảng đã chọn)**")
+        st.dataframe(daily, use_container_width=True, hide_index=True)
+
+        total_vnd_filtered = filtered["cost_vnd"].sum()
+        st.markdown(
+            f'<div class="ps-cost-box"><div class="ps-cost-label">Tổng trong khoảng đã chọn</div>'
+            f'<div class="ps-cost-num">{total_vnd_filtered:,.0f}₫</div></div>',
+            unsafe_allow_html=True,
+        )
+
+        with st.expander(f"📜 Xem chi tiết log ({len(filtered)} dòng)"):
+            st.dataframe(
+                filtered.sort_values("timestamp", ascending=False),
+                use_container_width=True,
+                hide_index=True,
+            )
+
+        with open(LOG_PATH, "rb") as f:
+            st.download_button(
+                "⬇️ Tải toàn bộ file log (.csv)",
+                data=f.read(),
+                file_name="billing_log.csv",
+                mime="text/csv",
+                use_container_width=True,
+            )
 
     st.markdown("</div>", unsafe_allow_html=True)
